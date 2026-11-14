@@ -995,7 +995,6 @@ public sealed partial class PlantHolderSystem : EntitySystem
             seed.ConsumeGasses.Remove(gas);
             seed.ExudeGasses.Remove(gas);
         }
-      
     }
       // End Triad
 }
