@@ -8,7 +8,7 @@ using Robust.Shared.Physics;
 using Robust.Shared.Physics.Collision.Shapes;
 using Robust.Shared.Physics.Components;
 using Content.Shared.Shuttles.Components; // Frontier
-
+using System.Diagnostics;
 namespace Content.Server.Shuttles.Systems;
 
 public sealed partial class DockingSystem
@@ -295,17 +295,30 @@ public sealed partial class DockingSystem
         Comparer<TPriority> comparer,
         DockType dockType = DockType.Airlock)
     {
+        var profileStart = Stopwatch.GetTimestamp();
+
+        long candidateGenerationTicks = 0;
+        long candidateValidationTicks = 0;
+        long validSpawnTicks = 0;
+        long findGridsTicks = 0;
+
+        var candidatesGenerated = 0;
+        var candidatesTested = 0;
+
         var stationDocks = GetDocks(stationUid);
         var shuttleDocks = GetDocks(shuttleUid);
 
-        var stationGrid = _gridQuery.GetComponent(shuttleUid);
+        var stationGrid = _gridQuery.GetComponent(stationUid);
         var shuttleGrid = _gridQuery.GetComponent(shuttleUid);
         var shuttleLocalAABB = shuttleGrid.LocalAABB;
         var shuttleFixturesComp = Comp<FixturesComponent>(shuttleUid);
-        var stationIsMap = HasComp<MapComponent>(shuttleUid);
+        var stationIsMap = HasComp<MapComponent>(stationUid);
         var stationXform = _xformQuery.GetComponent(stationUid);
 
         var stationWorldAngle = _transform.GetWorldRotation(stationXform).Reduced();
+
+        // Generate candidate configurations.
+        var generationStart = Stopwatch.GetTimestamp();
 
         var configs = GetCandidateDockingConfigs(
             stationUid,
@@ -317,19 +330,67 @@ public sealed partial class DockingSystem
             transformer
         );
 
+        candidateGenerationTicks = Stopwatch.GetTimestamp() - generationStart;
+        candidatesGenerated = configs.Count;
+
         List<Entity<MapGridComponent>> grids = [];
+
         while (configs.Count != 0)
         {
             var dc = configs.Dequeue();
-            if (DockingConfigCandidateIsValid(dc, stationUid, stationXform, shuttleLocalAABB, shuttleFixturesComp, stationGrid, stationIsMap, stationWorldAngle, ref grids))
+            candidatesTested++;
+
+            var validationStart = Stopwatch.GetTimestamp();
+
+            var valid = DockingConfigCandidateIsValid(
+                dc,
+                stationUid,
+                stationXform,
+                shuttleLocalAABB,
+                shuttleFixturesComp,
+                stationGrid,
+                stationIsMap,
+                stationWorldAngle,
+                ref grids,
+                ref validSpawnTicks,
+                ref findGridsTicks
+            );
+
+            candidateValidationTicks += Stopwatch.GetTimestamp() - validationStart;
+
+            if (valid)
             {
+                LogDockProfile(true);
                 return dc;
             }
-
         }
 
+        LogDockProfile(false);
         return null;
+
+        void LogDockProfile(bool found)
+        {
+            var totalTicks = Stopwatch.GetTimestamp() - profileStart;
+
+            static double Ms(long ticks) =>
+                ticks * 1000.0 / Stopwatch.Frequency;
+
+            _sawmill.Info(
+                $"[DockProfile] GetDockingConfigFast | " +
+                $"Total={Ms(totalTicks):F2}ms | " +
+                $"Generation={Ms(candidateGenerationTicks):F2}ms | " +
+                $"Validation={Ms(candidateValidationTicks):F2}ms | " +
+                $"ValidSpawn={Ms(validSpawnTicks):F2}ms | " +
+                $"FindGrids={Ms(findGridsTicks):F2}ms | " +
+                $"Candidates={candidatesGenerated} | " +
+                $"Tested={candidatesTested} | " +
+                $"ShuttleDocks={shuttleDocks.Count} | " +
+                $"StationDocks={stationDocks.Count} | " +
+                $"Found={found}");
+        }
     }
+
+
 
     private bool DockingConfigCandidateIsValid(
         DockingConfig dc,
@@ -340,7 +401,9 @@ public sealed partial class DockingSystem
         MapGridComponent stationGrid,
         bool stationIsMap,
         Angle stationWorldAngle,
-        ref List<Entity<MapGridComponent>> grids)
+        ref List<Entity<MapGridComponent>> grids,
+        ref long validSpawnTicks,
+        ref long findGridsTicks)
     {
         if (!dc.Docks.Any())
             return false;
@@ -355,32 +418,71 @@ public sealed partial class DockingSystem
             return false;
         }
 
-        var trueOffsetAngle = (firstDockPair.StationDockXform.LocalRotation.Opposite() - firstDockPair.ShuttleDockXform.LocalRotation).Reduced();
-        dc.SetMatty(firstDockPair.ShuttleDockXform, firstDockPair.StationDockXform);
+        var trueOffsetAngle = (
+            firstDockPair.StationDockXform.LocalRotation.Opposite() -
+            firstDockPair.ShuttleDockXform.LocalRotation).Reduced();
+
+        dc.SetMatty(
+            firstDockPair.ShuttleDockXform,
+            firstDockPair.StationDockXform);
+
         var gridEntity = new Entity<MapGridComponent>(stationUid, stationGrid);
-        if (!ValidSpawn(gridEntity, dc.Matty, trueOffsetAngle, shuttleFixturesComp, stationIsMap))
-        {
+
+        // Profile ValidSpawn.
+        var spawnStart = Stopwatch.GetTimestamp();
+
+        var validSpawn = ValidSpawn(
+            gridEntity,
+            dc.Matty,
+            trueOffsetAngle,
+            shuttleFixturesComp,
+            stationIsMap);
+
+        validSpawnTicks += Stopwatch.GetTimestamp() - spawnStart;
+
+        if (!validSpawn)
             return false;
-        }
 
-        // Can't just use the AABB as we want to get bounds as tight as possible.
-        var gridPosition = new EntityCoordinates(stationUid, Vector2.Transform(Vector2.Zero, dc.Matty));
-        var spawnPosition = new EntityCoordinates(stationXform.MapUid!.Value, _transform.ToMapCoordinates(gridPosition).Position);
+        // Calculate docking bounds.
+        var gridPosition = new EntityCoordinates(
+            stationUid,
+            Vector2.Transform(Vector2.Zero, dc.Matty));
 
-        // TODO: use tight bounds
-        var targetWorldAngle = (stationWorldAngle + trueOffsetAngle).Reduced(); // Frontier
-        var dockedBounds = new Box2Rotated(shuttleLocalAABB.Translated(spawnPosition.Position), targetWorldAngle, spawnPosition.Position); // Frontier: targetAngle<targetWorldAngle
+        var spawnPosition = new EntityCoordinates(
+            stationXform.MapUid!.Value,
+            _transform.ToMapCoordinates(gridPosition).Position);
 
-        // Check if there's no intersecting grids (AKA oh god it's docking at cargo).
+        var targetWorldAngle = (
+            stationWorldAngle + trueOffsetAngle).Reduced();
+
+        var dockedBounds = new Box2Rotated(
+            shuttleLocalAABB.Translated(spawnPosition.Position),
+            targetWorldAngle,
+            spawnPosition.Position);
+
+        // Profile grid intersection check.
         grids.Clear();
-        _mapSystem.FindGridsIntersecting(stationXform.MapID, dockedBounds, ref grids, includeMap: false);
-        if (grids.Any(o => o.Owner != dc.TargetGridUid && o.Owner != stationXform.MapUid))
+
+        var findStart = Stopwatch.GetTimestamp();
+
+        _mapSystem.FindGridsIntersecting(
+            stationXform.MapID,
+            dockedBounds,
+            ref grids,
+            includeMap: false);
+
+        findGridsTicks += Stopwatch.GetTimestamp() - findStart;
+
+        if (grids.Any(o =>
+                o.Owner != dc.TargetGridUid &&
+                o.Owner != stationXform.MapUid))
         {
             return false;
         }
 
         return true;
     }
+
 
 
     private PriorityQueue<DockingConfig, TPriority> GetCandidateDockingConfigs<TPriority>(
