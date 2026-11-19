@@ -472,7 +472,7 @@ public sealed partial class PublicTransitSystem : EntitySystem
         // Priority sorts first, so a non-priority winner proves no config reaches the marked berth.
         if (tagged > 0 && !_dockSystem.IsConfigPriority(config, BerthTag))
         {
-            Log.Info($"Berth check failed for {ToPrettyString(station)}: {tagged} tagged berth(s) present but no config reaches one (best config docks at {string.Join(", ", config.Docks.Select(d => d.DockBUid))}).");
+            Log.Info($"Berth check failed for {ToPrettyString(station)}: {tagged} tagged berth(s) present but no config reaches one (best config docks at {string.Join(", ", config.Docks.Select(d => d.StationDockUid))}).");
             return false;
         }
 

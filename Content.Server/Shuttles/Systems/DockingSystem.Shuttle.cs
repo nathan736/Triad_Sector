@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Numerics;
 using Content.Server.Shuttles.Components;
+using Content.Shared._Triad.Holosign;
 using Robust.Shared.Map;
 using Robust.Shared.Map.Components;
 using Robust.Shared.Physics;
@@ -35,325 +36,84 @@ public sealed partial class DockingSystem
     }
 
     /// <summary>
-    /// Checks if 2 docks can be connected by moving the shuttle directly onto docks.
-    /// </summary>
-    private bool CanDock(
-        DockingComponent shuttleDock,
-        TransformComponent shuttleDockXform,
-        DockingComponent gridDock,
-        TransformComponent gridDockXform,
-        Box2 shuttleAABB,
-        Angle targetGridRotation,
-        FixturesComponent shuttleFixtures,
-        Entity<MapGridComponent> gridEntity,
-        bool isMap,
-        out Matrix3x2 matty,
-        out Box2 shuttleDockedAABB,
-        out Angle gridRotation)
-    {
-        shuttleDockedAABB = Box2.UnitCentered;
-        gridRotation = Angle.Zero;
-        matty = Matrix3x2.Identity;
-
-        if (shuttleDock.Docked ||
-            gridDock.Docked ||
-            !shuttleDockXform.Anchored ||
-            !gridDockXform.Anchored)
-        {
-            return false;
-        }
-
-        // Frontier: check dock types
-        if ((shuttleDock.DockType & gridDock.DockType) == DockType.None)
-            return false;
-        // End Frontier
-
-        // First, get the station dock's position relative to the shuttle, this is where we rotate it around
-        var stationDockPos = shuttleDockXform.LocalPosition +
-                             shuttleDockXform.LocalRotation.RotateVec(new Vector2(0f, -1f));
-
-        // Need to invert the grid's angle.
-        var shuttleDockAngle = shuttleDockXform.LocalRotation;
-        var gridDockAngle = gridDockXform.LocalRotation.Opposite();
-        var offsetAngle = gridDockAngle - shuttleDockAngle;
-
-        var stationDockMatrix = Matrix3Helpers.CreateInverseTransform(stationDockPos, shuttleDockAngle);
-        var gridXformMatrix = Matrix3Helpers.CreateTransform(gridDockXform.LocalPosition, gridDockAngle);
-        matty = Matrix3x2.Multiply(stationDockMatrix, gridXformMatrix);
-
-        if (!ValidSpawn(gridEntity, matty, offsetAngle, shuttleFixtures, isMap))
-            return false;
-
-        shuttleDockedAABB = matty.TransformBox(shuttleAABB);
-        gridRotation = offsetAngle.Reduced();
-        return true;
-    }
-
-    /// <summary>
-    /// Gets docking config between 2 specific docks.
-    /// </summary>
-    public DockingConfig? GetDockingConfig(
-        EntityUid shuttleUid,
-        EntityUid targetGrid,
-        EntityUid shuttleDockUid,
-        DockingComponent shuttleDock,
-        EntityUid gridDockUid,
-        DockingComponent gridDock)
-    {
-        var shuttleDocks = new List<Entity<DockingComponent>>(1)
-       {
-           (shuttleDockUid, shuttleDock)
-       };
-
-        var gridDocks = new List<Entity<DockingComponent>>(1)
-       {
-           (gridDockUid, gridDock)
-       };
-
-        return GetDockingConfigPrivate(shuttleUid, targetGrid, shuttleDocks, gridDocks);
-    }
-
-    /// <summary>
     /// Tries to get a valid docking configuration for the shuttle to the target grid.
     /// </summary>
     /// <param name="priorityTag">Priority docking tag to prefer, e.g. for emergency shuttle</param>
-    public DockingConfig? GetDockingConfig(EntityUid shuttleUid, EntityUid targetGrid, string? priorityTag = null, DockType dockType = DockType.Airlock) // Frontier: add dockType
+    public DockingConfig? GetDockingConfig(
+        EntityUid shuttleUid,
+        EntityUid stationUid,
+        string? priorityTag = null,
+        DockType dockType = DockType.Airlock)// Frontier: add
     {
-        var gridDocks = GetDocks(targetGrid);
-        var shuttleDocks = GetDocks(shuttleUid);
+        var targetGridAngle = _transform.GetWorldRotation(stationUid).Reduced();
 
-        return GetDockingConfigPrivate(shuttleUid, targetGrid, shuttleDocks, gridDocks, priorityTag, dockType); // Frontier: add dockType
+        var conf = GetDockingConfigFast(shuttleUid,
+            stationUid,
+            dc =>
+            {
+                var configPriority = !IsConfigPriority(dc, priorityTag);
+                var dockCount = dc.Docks.Count;
+                var angleDelta = Math.Abs(Angle.ShortestDistance(dc.Angle.Reduced(), targetGridAngle).Theta);
+                return (!configPriority, -dockCount, angleDelta); // It tries to minimize from left to right, so lower is better
+            },
+            Comparer<(bool, int, double)>.Default,
+            dockType
+        );
+
+        if (conf is not null)
+        {
+            conf.TargetGridUid = stationUid;
+        }
+
+        return conf;
     }
-
-    /// <summary>
-    /// Tries to get a docking config at the specified coordinates and angle.
-    /// </summary>
-    public DockingConfig? GetDockingConfigAt(EntityUid shuttleUid,
-        EntityUid targetGrid,
+    public DockingConfig? GetDockingConfigAt(
+        EntityUid shuttleUid,
+        EntityUid stationUid,
         EntityCoordinates coordinates,
         Angle angle,
         bool fallback = true,
         DockType dockType = DockType.Airlock, // Frontier
         string? priorityTag = null) // Triad: prefer a berth flagged for this traffic, see the fallback
     {
-        var gridDocks = GetDocks(targetGrid);
-        var shuttleDocks = GetDocks(shuttleUid);
-
-        var configs = GetDockingConfigs(shuttleUid, targetGrid, shuttleDocks, gridDocks, dockType); // Frontier: add dockType
-
-        foreach (var config in configs)
-        {
-            if (config.Coordinates.Equals(coordinates) && config.Angle.EqualsApprox(angle, 0.15))
+        var conf = GetDockingConfigFast(shuttleUid,
+            stationUid,
+            dc =>
             {
-                return config;
+                var matchesPosition = dc.Coordinates.Equals(coordinates) && dc.Angle.EqualsApprox(angle, 0.15);
+                var configPriority = !IsConfigPriority(dc, priorityTag);
+                var dockCount = -dc.Docks.Count;
+                var angleDelta = Math.Abs(Angle.ShortestDistance(dc.Angle.Reduced(), angle).Theta);
+                return (!matchesPosition, !configPriority, -dockCount, angleDelta); // It tries to minimize from left to right, so lower is better
+            },
+            Comparer<(bool, bool, int, double)>.Default,
+            dockType);
+
+        // Triad: if the exact requested berth was not free, so rank the rest rather than grabbing
+        // whatever enumerated first out of a HashSet. Same comparison departure used, so the
+        // fallback lands on the berth and the approach side that were planned for. With no tag this
+        // is the old behaviour, since neither tag predicate matches null.
+        if (conf is not null && fallback == false)
+        {
+            if (conf.Coordinates.Equals(coordinates) && conf.Angle.EqualsApprox(angle, 0.15))
+            {
+                return conf;
+            }
+            else
+            {
+                return null;
             }
         }
-
-        if (fallback && configs.Count > 0)
+        else
         {
-            // Triad: the exact requested berth was not free, so rank the rest rather than grabbing
-            // whatever enumerated first out of a HashSet. Same comparison departure used, so the
-            // fallback lands on the berth and the approach side that were planned for. With no tag this
-            // is the old behaviour, since neither tag predicate matches null.
-            return SortDockingConfigs(configs, targetGrid, priorityTag).First();
+            return conf;
         }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Gets all docking configs between the 2 grids.
-    /// </summary>
-    private List<DockingConfig> GetDockingConfigs(
-        EntityUid shuttleUid,
-        EntityUid targetGrid,
-        List<Entity<DockingComponent>> shuttleDocks,
-        List<Entity<DockingComponent>> gridDocks,
-        DockType dockType) // Frontier: add dockType
-    {
-        var validDockConfigs = new List<DockingConfig>();
-
-        if (gridDocks.Count <= 0)
-            return validDockConfigs;
-
-        var targetGridGrid = _gridQuery.GetComponent(targetGrid);
-        var targetGridXform = _xformQuery.GetComponent(targetGrid);
-        var targetGridAngle = _transform.GetWorldRotation(targetGridXform).Reduced();
-        var shuttleFixturesComp = Comp<FixturesComponent>(shuttleUid);
-        var shuttleAABB = _gridQuery.GetComponent(shuttleUid).LocalAABB;
-
-        var isMap = HasComp<MapComponent>(targetGrid);
-
-        var grids = new List<Entity<MapGridComponent>>();
-        if (shuttleDocks.Count > 0)
-        {
-            // We'll try all combinations of shuttle docks and see which one is most suitable
-            foreach (var (dockUid, shuttleDock) in shuttleDocks)
-            {
-                var shuttleDockXform = _xformQuery.GetComponent(dockUid);
-
-                // Frontier: skip docks that don't match type
-                if ((shuttleDock.DockType & dockType) == DockType.None)
-                    continue;
-                // End Frontier
-
-                foreach (var (gridDockUid, gridDock) in gridDocks)
-                {
-                    var gridXform = _xformQuery.GetComponent(gridDockUid);
-
-                    // Frontier: skip docks that don't match type
-                    if ((gridDock.DockType & dockType) == DockType.None)
-                        continue;
-                    // End Frontier
-
-                    // Triad: a berth may demand a specific shuttle side; see RequiredShuttleTag.
-                    if (!ShuttleSideAllowed(dockUid, gridDockUid))
-                        continue;
-
-                    if (!CanDock(
-                            shuttleDock, shuttleDockXform,
-                            gridDock, gridXform,
-                            shuttleAABB,
-                            targetGridAngle,
-                            shuttleFixturesComp,
-                            (targetGrid, targetGridGrid),
-                            isMap,
-                            out var matty,
-                            out var dockedAABB,
-                            out var targetAngle))
-                    {
-                        continue;
-                    }
-
-                    // Can't just use the AABB as we want to get bounds as tight as possible.
-                    var gridPosition = new EntityCoordinates(targetGrid, Vector2.Transform(Vector2.Zero, matty));
-                    var spawnPosition = new EntityCoordinates(targetGridXform.MapUid!.Value, _transform.ToMapCoordinates(gridPosition).Position);
-
-                    // TODO: use tight bounds
-                    var targetWorldAngle = (targetGridAngle + targetAngle).Reduced(); // Frontier
-                    var dockedBounds = new Box2Rotated(shuttleAABB.Translated(spawnPosition.Position), targetWorldAngle, spawnPosition.Position); // Frontier: targetAngle<targetWorldAngle
-
-                    // Check if there's no intersecting grids (AKA oh god it's docking at cargo).
-                    grids.Clear();
-                    _mapSystem.FindGridsIntersecting(targetGridXform.MapID, dockedBounds, ref grids, includeMap: false);
-                    if (grids.Any(o => o.Owner != targetGrid && o.Owner != targetGridXform.MapUid))
-                    {
-                        continue;
-                    }
-
-                    // Alright well the spawn is valid now to check how many we can connect
-                    // Get the matrix for each shuttle dock and test it against the grid docks to see
-                    // if the connected position / direction matches.
-
-                    var dockedPorts = new List<(EntityUid DockAUid, EntityUid DockBUid, DockingComponent DockA, DockingComponent DockB)>()
-                   {
-                       (dockUid, gridDockUid, shuttleDock, gridDock),
-                   };
-
-                    dockedAABB = dockedAABB.Rounded(DockRoundingDigits);
-
-                    foreach (var (otherUid, other) in shuttleDocks)
-                    {
-                        if (other == shuttleDock)
-                            continue;
-
-                        // Frontier: skip docks that don't match type
-                        if ((other.DockType & dockType) == DockType.None)
-                            continue;
-                        // End Frontier
-
-                        foreach (var (otherGridUid, otherGrid) in gridDocks)
-                        {
-                            if (otherGrid == gridDock)
-                                continue;
-
-                            // Frontier: skip docks that don't match type
-                            if ((otherGrid.DockType & dockType) == DockType.None)
-                                continue;
-                            // End Frontier
-
-                            // Triad: side requirement applies to aggregated pairs too.
-                            if (!ShuttleSideAllowed(otherUid, otherGridUid))
-                                continue;
-
-                            if (!CanDock(
-                                    other,
-                                    _xformQuery.GetComponent(otherUid),
-                                    otherGrid,
-                                    _xformQuery.GetComponent(otherGridUid),
-                                    shuttleAABB,
-                                    targetGridAngle,
-                                    shuttleFixturesComp,
-                                    (targetGrid, targetGridGrid),
-                                    isMap,
-                                    out _,
-                                    out var otherdockedAABB,
-                                    out var otherTargetAngle))
-                            {
-                                continue;
-                            }
-
-                            otherdockedAABB = otherdockedAABB.Rounded(DockRoundingDigits);
-
-                            // Different setup: allow small tolerance on angle / AABB to aggregate more ports.
-                            if (!targetAngle.EqualsApprox(otherTargetAngle, 0.05) ||
-                                !Box2ApproximatelyEquals(dockedAABB, otherdockedAABB, 0.05f))
-                            {
-                                continue;
-                            }
-
-                            dockedPorts.Add((otherUid, otherGridUid, other, otherGrid));
-                        }
-                    }
-
-                    validDockConfigs.Add(new DockingConfig()
-                    {
-                        Docks = dockedPorts,
-                        Coordinates = gridPosition,
-                        Area = dockedAABB,
-                        Angle = targetAngle,
-                    });
-                }
-            }
-        }
-
-        return validDockConfigs;
-    }
-
-    private static bool Box2ApproximatelyEquals(Box2 a, Box2 b, float epsilon)
-    {
-        return MathF.Abs(a.Left - b.Left) <= epsilon &&
-               MathF.Abs(a.Right - b.Right) <= epsilon &&
-               MathF.Abs(a.Top - b.Top) <= epsilon &&
-               MathF.Abs(a.Bottom - b.Bottom) <= epsilon;
-    }
-
-    private DockingConfig? GetDockingConfigPrivate(
-        EntityUid shuttleUid,
-        EntityUid targetGrid,
-        List<Entity<DockingComponent>> shuttleDocks,
-        List<Entity<DockingComponent>> gridDocks,
-        string? priorityTag = null,
-        DockType dockType = DockType.Airlock) // Frontier
-    {
-        var validDockConfigs = GetDockingConfigs(shuttleUid, targetGrid, shuttleDocks, gridDocks, dockType); // Frontier: add dockType
-
-        if (validDockConfigs.Count <= 0)
-            return null;
-
-        validDockConfigs = SortDockingConfigs(validDockConfigs, targetGrid, priorityTag);
-
-        var location = validDockConfigs.First();
-        location.TargetGrid = targetGrid;
-        // TODO: Ideally do a hyperspace warpin, just have it run on like a 10 second timer.
-
-        return location;
     }
 
     public bool IsConfigPriority(DockingConfig config, string? priorityTag)
     {
         return config.Docks.Any(docks =>
-            TryComp<PriorityDockComponent>(docks.DockBUid, out var priority)
+            TryComp<PriorityDockComponent>(docks.StationDockUid, out var priority)
             && priority.Tag?.Equals(priorityTag) == true);
     }
 
@@ -373,24 +133,6 @@ public sealed partial class DockingSystem
 
         return TryComp<PriorityDockComponent>(shuttleDockUid, out var shuttlePriority)
                && shuttlePriority.Tag?.Equals(required) == true;
-    }
-
-    /// <summary>
-    /// Ranks candidate configs best-first.
-    /// </summary>
-    // Triad: departure and arrival used to rank differently, so a shuttle could plan one berth and take
-    // another. One comparison, used by both. Which face the shuttle presents is not a criterion on
-    // purpose: where a berth is tight only one orientation survives CanDock/ValidSpawn at all, and where
-    // it is open either face docks port-to-port equally well.
-    private List<DockingConfig> SortDockingConfigs(List<DockingConfig> configs, EntityUid targetGrid, string? priorityTag)
-    {
-        var targetGridAngle = _transform.GetWorldRotation(targetGrid).Reduced();
-
-        return configs
-            .OrderByDescending(x => IsConfigPriority(x, priorityTag))
-            .ThenByDescending(x => x.Docks.Count)
-            .ThenBy(x => Math.Abs(Angle.ShortestDistance(x.Angle.Reduced(), targetGridAngle).Theta))
-            .ToList();
     }
 
     /// <summary>
@@ -489,4 +231,244 @@ public sealed partial class DockingSystem
 
         return false;
     }
+
+
+    public DockingConfig? GetDockingConfig(
+        EntityUid shuttleUid,
+        EntityUid stationUid,
+        EntityUid shuttleDockUid,
+        EntityUid stationDockUid)
+    {
+
+        var shuttleDockXform = _xformQuery.GetComponent(shuttleDockUid);
+        var shuttleDockPosition = shuttleDockXform.LocalPosition;
+        var stationDockXform = _xformQuery.GetComponent(stationDockUid);
+        var stationDockPosition = stationDockXform.LocalPosition;
+
+        var conf = GetDockingConfigFast(shuttleUid,
+            stationUid,
+            (dc) =>
+            {
+                var hasPair = false;
+                var hasShuttle = false;
+                var hasStation = false;
+                foreach (var dockPair in dc.Docks)
+                {
+                    if (dockPair.ShuttleDockUid == shuttleDockUid)
+                    {
+                        hasShuttle = true;
+                        if (dockPair.StationDockUid == stationDockUid)
+                        {
+                            hasStation = true;
+                            hasPair = true;
+                        }
+                    }
+                    else
+                    {
+                        if (dockPair.StationDockUid == stationDockUid)
+                        {
+                            hasStation = true;
+                        }
+                    }
+                }
+                var hasBoth = hasShuttle && hasStation;
+                var squaredDistance = (Vector2.Transform(shuttleDockPosition, dc.Matty) - stationDockPosition)
+                    .LengthSquared();
+                return (!hasPair, !hasBoth, squaredDistance); // It tries to minimize from left to right, so lower is better
+            },
+            Comparer<(bool, bool, double)>.Default
+        );
+
+        if (conf is not null)
+        {
+            conf.TargetGridUid = stationUid;
+        }
+
+        return conf;
+    }
+
+
+    private DockingConfig? GetDockingConfigFast<TPriority>(
+        EntityUid shuttleUid,
+        EntityUid stationUid,
+        Func<DockingConfig, TPriority> transformer,
+        Comparer<TPriority> comparer,
+        DockType dockType = DockType.Airlock)
+    {
+        var stationDocks = GetDocks(stationUid);
+        var shuttleDocks = GetDocks(shuttleUid);
+
+        var stationGrid = _gridQuery.GetComponent(shuttleUid);
+        var shuttleGrid = _gridQuery.GetComponent(shuttleUid);
+        var shuttleLocalAABB = shuttleGrid.LocalAABB;
+        var shuttleFixturesComp = Comp<FixturesComponent>(shuttleUid);
+        var stationIsMap = HasComp<MapComponent>(shuttleUid);
+        var stationXform = _xformQuery.GetComponent(stationUid);
+
+        var stationWorldAngle = _transform.GetWorldRotation(stationXform).Reduced();
+
+        var configs = GetCandidateDockingConfigs(
+            stationUid,
+            shuttleDocks,
+            stationDocks,
+            shuttleGrid.LocalAABB,
+            dockType,
+            comparer,
+            transformer
+        );
+
+        List<Entity<MapGridComponent>> grids = [];
+        while (configs.Count != 0)
+        {
+            var dc = configs.Dequeue();
+            if (DockingConfigCandidateIsValid(dc, stationUid, stationXform, shuttleLocalAABB, shuttleFixturesComp, stationGrid, stationIsMap, stationWorldAngle, ref grids))
+            {
+                return dc;
+            }
+
+        }
+
+        return null;
+    }
+
+    private bool DockingConfigCandidateIsValid(
+        DockingConfig dc,
+        EntityUid stationUid,
+        TransformComponent stationXform,
+        Box2 shuttleLocalAABB,
+        FixturesComponent shuttleFixturesComp,
+        MapGridComponent stationGrid,
+        bool stationIsMap,
+        Angle stationWorldAngle,
+        ref List<Entity<MapGridComponent>> grids)
+    {
+        if (!dc.Docks.Any())
+            return false;
+
+        var firstDockPair = dc.Docks.First();
+
+        if (firstDockPair.ShuttleDock.Docked ||
+            firstDockPair.StationDock.Docked ||
+            !firstDockPair.ShuttleDockXform.Anchored ||
+            !firstDockPair.StationDockXform.Anchored)
+        {
+            return false;
+        }
+
+        var trueOffsetAngle = (firstDockPair.StationDockXform.LocalRotation.Opposite() - firstDockPair.ShuttleDockXform.LocalRotation).Reduced();
+        dc.SetMatty(firstDockPair.ShuttleDockXform, firstDockPair.StationDockXform);
+        var gridEntity = new Entity<MapGridComponent>(stationUid, stationGrid);
+        if (!ValidSpawn(gridEntity, dc.Matty, trueOffsetAngle, shuttleFixturesComp, stationIsMap))
+        {
+            return false;
+        }
+
+        // Can't just use the AABB as we want to get bounds as tight as possible.
+        var gridPosition = new EntityCoordinates(stationUid, Vector2.Transform(Vector2.Zero, dc.Matty));
+        var spawnPosition = new EntityCoordinates(stationXform.MapUid!.Value, _transform.ToMapCoordinates(gridPosition).Position);
+
+        // TODO: use tight bounds
+        var targetWorldAngle = (stationWorldAngle + trueOffsetAngle).Reduced(); // Frontier
+        var dockedBounds = new Box2Rotated(shuttleLocalAABB.Translated(spawnPosition.Position), targetWorldAngle, spawnPosition.Position); // Frontier: targetAngle<targetWorldAngle
+
+        // Check if there's no intersecting grids (AKA oh god it's docking at cargo).
+        grids.Clear();
+        _mapSystem.FindGridsIntersecting(stationXform.MapID, dockedBounds, ref grids, includeMap: false);
+        if (grids.Any(o => o.Owner != dc.TargetGridUid && o.Owner != stationXform.MapUid))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+
+    private PriorityQueue<DockingConfig, TPriority> GetCandidateDockingConfigs<TPriority>(
+        EntityUid stationUid,
+        List<Entity<DockingComponent>> shuttleDocks,
+        List<Entity<DockingComponent>> stationDocks,
+        Box2 shuttleAABB,
+        DockType dockType,
+        IComparer<TPriority> comparer,
+        Func<DockingConfig, TPriority> transformer)
+    {
+        var validDockConfigs = new Dictionary<
+            (int, int, int, int, int, int),
+            DockingConfig>();
+
+        if (stationDocks.Count <= 0 || shuttleDocks.Count <= 0)
+            return new();
+
+        List<(float x, float y, Angle angle, Direction cardinal, EntityUid euid, DockingComponent dc, TransformComponent xform)> ToDockDetails(
+            List<Entity<DockingComponent>> docks)
+        {
+            List<(float x, float y, Angle angle, Direction cardinal, EntityUid euid, DockingComponent dc, TransformComponent xform)> output = [];
+            foreach (var (gridDockUid, gridDockComp) in docks)
+            {
+                if ((gridDockComp.DockType & dockType) == DockType.None)
+                    continue;
+                var dockXform = _xformQuery.GetComponent(gridDockUid);
+                var dockLocalPos = dockXform.LocalPosition;
+
+                output.Add((dockLocalPos.X, dockLocalPos.Y, dockXform.LocalRotation, dockXform.LocalRotation.GetCardinalDir(), gridDockUid, gridDockComp, dockXform));
+            }
+            return output;
+        }
+
+        var shuttleDockDetails = ToDockDetails(shuttleDocks);
+        var stationDockDetails = ToDockDetails(stationDocks);
+
+        foreach (var (stationDockX, stationDockY, stationDockAngle, stationDockCardinal, stationDockUid, stationDock, stationDockXform) in stationDockDetails)
+        {
+            var stationDockOppositeA = stationDockAngle.Opposite();
+            foreach (var (shuttleDockX, shuttleDockY, shuttleDockAngle, shuttleDockCardinal, shuttleDockUid, shuttleDock, shuttleDockXform) in shuttleDockDetails)
+            {
+                if ((stationDock.DockType & shuttleDock.DockType) == DockType.None)
+                    continue;
+
+                // Triad: a berth may demand a specific shuttle side; see RequiredShuttleTag.
+                if (!ShuttleSideAllowed(shuttleDockUid, stationDockUid))
+                    continue;
+
+                var matty = DockingConfig.CalcMatty(shuttleDockX,
+                    shuttleDockY,
+                    shuttleDockCardinal,
+                    stationDockX,
+                    stationDockY,
+                    stationDockCardinal);
+
+                var key = (
+                    (int)(DockingConfig.MattyRadix * matty.M11),
+                    (int)(DockingConfig.MattyRadix * matty.M12),
+                    (int)(DockingConfig.MattyRadix * matty.M21),
+                    (int)(DockingConfig.MattyRadix * matty.M22),
+                    (int)(DockingConfig.MattyRadix * matty.M31),
+                    (int)(DockingConfig.MattyRadix * matty.M32)
+                    );
+
+                if(validDockConfigs.TryGetValue(key, out var dockConfig))
+                {
+                    dockConfig.Docks.Add((shuttleDockUid, stationDockUid, shuttleDock, stationDock, shuttleDockXform, stationDockXform));
+                }
+                else
+                {
+                    validDockConfigs.Add(key,
+                        new()
+                    {
+                        Docks = [(shuttleDockUid, stationDockUid, shuttleDock, stationDock, shuttleDockXform, stationDockXform)],
+                        TargetGridUid = stationUid,
+                        Angle = (stationDockOppositeA - shuttleDockAngle).Reduced(),
+                        Area = matty.TransformBox(shuttleAABB),
+                        Coordinates = new EntityCoordinates(stationUid, Vector2.Transform(Vector2.Zero, matty)),
+                        Matty = matty
+                    });
+                }
+            }
+        }
+
+        return new(validDockConfigs.Values.Select(t => (t, transformer(t))), comparer);
+    }
+
+
+
 }

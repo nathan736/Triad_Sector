@@ -253,7 +253,7 @@ public sealed partial class ShuttleSystem
 
             if (escape != null)
             {
-                var config = _dockSystem.GetDockingConfig(grid.Value, xform.GridUid.Value, escape.Value.Entity, escape.Value.Component, uid, dock);
+                var config = _dockSystem.GetDockingConfig(grid.Value, xform.GridUid.Value, escape.Value.Entity, uid);
 
                 if (config != null)
                 {

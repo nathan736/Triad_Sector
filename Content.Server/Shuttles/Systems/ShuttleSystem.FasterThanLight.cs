@@ -844,7 +844,7 @@ public sealed partial class ShuttleSystem
             {
                 // Triad: receipt for the docked path; pairs chosen at arrival time. Info on purpose:
                 // sawmill debug is suppressed by default and this is once per arrival.
-                Log.Info($"FTL arrival: docking {ToPrettyString(uid)} at {ToPrettyString(target.EntityId)} via {config.Docks.Count} pair(s): {string.Join(", ", config.Docks.Select(d => $"{d.DockAUid}->{d.DockBUid}"))}");
+                Log.Info($"FTL arrival: docking {ToPrettyString(uid)} at {ToPrettyString(target.EntityId)} via {config.Docks.Count} pair(s): {string.Join(", ", config.Docks.Select(d => $"{d.ShuttleDockUid}->{d.StationDockUid}"))}");
                 FTLDock((uid, xform), config);
             }
 
@@ -1221,34 +1221,29 @@ public sealed partial class ShuttleSystem
         // If we have at least one dock pair, compute the precise translation required to align ports.
         if (config.Docks.Count > 0)
         {
-            var (dockAUid, dockBUid, _, _) = config.Docks[0];
+            var (_, _, _, _, dockAXform, dockBXform) = config.Docks[0];
+            // Compute each dock port’s world position using a half-tile forward offset along its local forward.
+            // This mirrors DockingSystem.Dock’s anchor calculation: LocalPosition + LocalRotation.ToWorldVec() / 2f
+            var aWorldPos = _transform.GetWorldPosition(dockAXform) + dockAXform.WorldRotation.ToWorldVec() / 2f;
+            var bWorldPos = _transform.GetWorldPosition(dockBXform) + dockBXform.WorldRotation.ToWorldVec() / 2f;
 
-            if (_xformQuery.TryGetComponent(dockAUid, out var dockAXform) &&
-                _xformQuery.TryGetComponent(dockBUid, out var dockBXform))
-            {
-                // Compute each dock port’s world position using a half-tile forward offset along its local forward.
-                // This mirrors DockingSystem.Dock’s anchor calculation: LocalPosition + LocalRotation.ToWorldVec() / 2f
-                var aWorldPos = _transform.GetWorldPosition(dockAXform) + dockAXform.WorldRotation.ToWorldVec() / 2f;
-                var bWorldPos = _transform.GetWorldPosition(dockBXform) + dockBXform.WorldRotation.ToWorldVec() / 2f;
+            var delta = bWorldPos - aWorldPos;
 
-                var delta = bWorldPos - aWorldPos;
+            // Triad: this snap-translation happens AFTER the config's coordinates were validated
+            // for overlap, and nothing re-validates the shifted position. For a well-formed config
+            // it is millimetres; anything tile-scale means the shuttle is being moved somewhere
+            // nothing approved, so leave a receipt.
+            if (delta.LengthSquared() > 0.25f)
+                Log.Warning($"FTLDock snap-translation moved {ToPrettyString(shuttle.Owner)} by {delta.Length():F2}m off its validated position (pair {config.Docks[0].ShuttleDockUid}->{config.Docks[0].StationDockUid}).");
 
-                // Triad: this snap-translation happens AFTER the config's coordinates were validated
-                // for overlap, and nothing re-validates the shifted position. For a well-formed config
-                // it is millimetres; anything tile-scale means the shuttle is being moved somewhere
-                // nothing approved, so leave a receipt.
-                if (delta.LengthSquared() > 0.25f)
-                    Log.Warning($"FTLDock snap-translation moved {ToPrettyString(shuttle.Owner)} by {delta.Length():F2}m off its validated position (pair {config.Docks[0].DockAUid}->{config.Docks[0].DockBUid}).");
-
-                // Translate the entire shuttle grid by delta so the first pair coincides exactly.
-                // Important: only adjust position (not rotation) to avoid drifting post-dock.
-                var shuttleXform = shuttle.Comp;
-                shuttleXform.WorldPosition += delta;
-            }
+            // Translate the entire shuttle grid by delta so the first pair coincides exactly.
+            // Important: only adjust position (not rotation) to avoid drifting post-dock.
+            var shuttleXform = shuttle.Comp;
+            shuttleXform.WorldPosition += delta;
         }
 
         // Now create weld joints between all matched docks.
-        foreach (var (dockAUid, dockBUid, dockA, dockB) in config.Docks)
+        foreach (var (dockAUid, dockBUid, dockA, dockB, dockAXform, dockBXform) in config.Docks)
         {
             _dockSystem.Dock((dockAUid, dockA), (dockBUid, dockB));
         }
